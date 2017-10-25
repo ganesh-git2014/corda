@@ -24,7 +24,7 @@ import javax.persistence.*
  * This class needs database transactions to be in-flight during method calls and init, otherwise it will throw
  * exceptions.
  */
-class PersistentNetworkMapService: NetworkMapService {
+class PersistentNetworkMapService : NetworkMapService {
 
     // Only the node_party_path column is needed to reconstruct a PartyAndCertificate but we have the others for human readability
     @Entity
