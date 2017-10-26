@@ -35,10 +35,6 @@ import net.corda.nodeapi.internal.ShutdownHook
 import net.corda.nodeapi.internal.addShutdownHook
 import net.corda.nodeapi.internal.serialization.*
 import net.corda.nodeapi.internal.serialization.amqp.AMQPServerSerializationScheme
-import org.apache.activemq.artemis.api.core.ActiveMQNotConnectedException
-import org.apache.activemq.artemis.api.core.RoutingType
-import org.apache.activemq.artemis.api.core.client.ActiveMQClient
-import org.apache.activemq.artemis.api.core.client.ClientMessage
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.time.Clock
@@ -181,15 +177,17 @@ open class Node(override val configuration: NodeConfiguration,
      * TODO this code used to rely on the networkmap node, we might want to look at a different solution.
      */
     private fun tryDetectIfNotPublicHost(host: String): String? {
-        if (!AddressUtils.isPublic(host)) {
+        return if (!AddressUtils.isPublic(host)) {
             val foundPublicIP = AddressUtils.tryDetectPublicIP()
-
-            if (foundPublicIP != null) {
+            if (foundPublicIP == null) {
+                networkMapClient?.myPublicHostname()
+            } else {
                 log.info("Detected public IP: ${foundPublicIP.hostAddress}. This will be used instead of the provided \"$host\" as the advertised address.")
-                return foundPublicIP.hostAddress
+                foundPublicIP.hostAddress
             }
+        } else {
+            null
         }
-        return null
     }
 
     override fun startMessagingService(rpcOps: RPCOps) {

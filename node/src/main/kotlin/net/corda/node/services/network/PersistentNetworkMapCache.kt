@@ -1,6 +1,7 @@
 package net.corda.node.services.network
 
 import net.corda.core.concurrent.CordaFuture
+import net.corda.core.crypto.SecureHash
 import net.corda.core.crypto.toStringShort
 import net.corda.core.identity.AbstractParty
 import net.corda.core.identity.CordaX500Name
@@ -16,6 +17,7 @@ import net.corda.core.node.services.NotaryService
 import net.corda.core.node.services.PartyInfo
 import net.corda.core.schemas.NodeInfoSchemaV1
 import net.corda.core.serialization.SingletonSerializeAsToken
+import net.corda.core.serialization.serialize
 import net.corda.core.utilities.NetworkHostAndPort
 import net.corda.core.utilities.loggerFor
 import net.corda.node.services.api.NetworkMapCacheBaseInternal
@@ -57,7 +59,7 @@ class NetworkMapCacheImpl(networkMapCacheBase: NetworkMapCacheBaseInternal, priv
  * Extremely simple in-memory cache of the network map.
  */
 @ThreadSafe
-open class PersistentNetworkMapCache(private val database: CordaPersistence, configuration: NodeConfiguration) : SingletonSerializeAsToken(), NetworkMapCacheBaseInternal {
+open class PersistentNetworkMapCache(private val database: CordaPersistence) : SingletonSerializeAsToken(), NetworkMapCacheBaseInternal {
     companion object {
         val logger = loggerFor<PersistentNetworkMapCache>()
     }
@@ -94,17 +96,33 @@ open class PersistentNetworkMapCache(private val database: CordaPersistence, con
                     .sortedBy { it.name.toString() }
         }
 
-    private val nodeInfoSerializer = NodeInfoWatcher(configuration.baseDirectory,
-            configuration.additionalNodeInfoPollingFrequencyMsec)
-
     init {
-        loadFromFiles()
         database.transaction { loadFromDB(session) }
     }
 
-    private fun loadFromFiles() {
-        logger.info("Loading network map from files..")
-        nodeInfoSerializer.nodeInfoUpdates().subscribe { node -> addNode(node) }
+    override val allNodeHashes: List<SecureHash>
+        get() {
+            return database.transaction {
+                val builder = session.criteriaBuilder
+                val query = builder.createQuery(String::class.java).run {
+                    from(NodeInfoSchemaV1.PersistentNodeInfo::class.java).run {
+                        select(get<String>(NodeInfoSchemaV1.PersistentNodeInfo::hash.name))
+                    }
+                }
+                session.createQuery(query).resultList.map { SecureHash.sha256(it) }
+            }
+        }
+
+    override fun getNodeByHash(nodeHash: SecureHash): NodeInfo? {
+        return database.transaction {
+            val builder = session.criteriaBuilder
+            val query = builder.createQuery(NodeInfoSchemaV1.PersistentNodeInfo::class.java).run {
+                from(NodeInfoSchemaV1.PersistentNodeInfo::class.java).run {
+                    where(builder.equal(get<String>(NodeInfoSchemaV1.PersistentNodeInfo::hash.name), nodeHash.toString()))
+                }
+            }
+            session.createQuery(query).resultList.singleOrNull()?.toNodeInfo()
+        }
     }
 
     override fun getPartyInfo(party: Party): PartyInfo? {
@@ -147,20 +165,22 @@ open class PersistentNetworkMapCache(private val database: CordaPersistence, con
                 }
             }
             val previousNode = registeredNodes.put(node.legalIdentities.first().owningKey, node) // TODO hack... we left the first one as special one
-            if (previousNode == null) {
-                logger.info("No previous node found")
-                database.transaction {
-                    updateInfoDB(node)
-                    changePublisher.onNext(MapChange.Added(node))
+            when {
+                previousNode == null -> {
+                    logger.info("No previous node found")
+                    database.transaction {
+                        updateInfoDB(node)
+                        changePublisher.onNext(MapChange.Added(node))
+                    }
                 }
-            } else if (previousNode != node) {
-                logger.info("Previous node was found as: $previousNode")
-                database.transaction {
-                    updateInfoDB(node)
-                    changePublisher.onNext(MapChange.Modified(node, previousNode))
+                previousNode != node -> {
+                    logger.info("Previous node was found as: $previousNode")
+                    database.transaction {
+                        updateInfoDB(node)
+                        changePublisher.onNext(MapChange.Modified(node, previousNode))
+                    }
                 }
-            } else {
-                logger.info("Previous node was identical to incoming one - doing nothing")
+                else -> logger.info("Previous node was identical to incoming one - doing nothing")
             }
         }
         _loadDBSuccess = true // This is used in AbstractNode to indicate that node is ready.
@@ -281,10 +301,12 @@ open class PersistentNetworkMapCache(private val database: CordaPersistence, con
         else result.map { it.toNodeInfo() }.singleOrNull() ?: throw IllegalStateException("More than one node with the same host and port")
     }
 
+
     /** Object Relational Mapping support. */
     private fun generateMappedObject(nodeInfo: NodeInfo): NodeInfoSchemaV1.PersistentNodeInfo {
         return NodeInfoSchemaV1.PersistentNodeInfo(
                 id = 0,
+                hash = nodeInfo.serialize().hash.toString(),
                 addresses = nodeInfo.addresses.map { NodeInfoSchemaV1.DBHostAndPort.fromHostAndPort(it) },
                 // TODO Another ugly hack with special first identity...
                 legalIdentitiesAndCerts = nodeInfo.legalIdentitiesAndCerts.mapIndexed { idx, elem ->

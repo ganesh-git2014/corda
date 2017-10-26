@@ -26,7 +26,7 @@ interface NodeConfiguration : NodeSSLConfiguration {
     val rpcUsers: List<User>
     val devMode: Boolean
     val devModeOptions: DevModeOptions?
-    val certificateSigningService: URL
+    val compatibilityZoneURL: URL?
     val certificateChainCheckPolicies: List<CertChainPolicyConfig>
     val verifierType: VerifierType
     val messageRedeliveryDelaySeconds: Int
@@ -84,7 +84,7 @@ data class NodeConfigurationImpl(
         override val trustStorePassword: String,
         override val dataSourceProperties: Properties,
         override val database: Properties?,
-        override val certificateSigningService: URL,
+        override val compatibilityZoneURL: URL? = null,
         override val minimumPlatformVersion: Int = 1,
         override val rpcUsers: List<User>,
         override val verifierType: VerifierType,

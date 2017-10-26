@@ -7,6 +7,7 @@ import net.corda.confidential.SwapIdentitiesFlow
 import net.corda.confidential.SwapIdentitiesHandler
 import net.corda.core.CordaException
 import net.corda.core.concurrent.CordaFuture
+import net.corda.core.crypto.SignedData
 import net.corda.core.flows.*
 import net.corda.core.identity.CordaX500Name
 import net.corda.core.identity.Party
@@ -20,10 +21,12 @@ import net.corda.core.node.services.*
 import net.corda.core.serialization.SerializationWhitelist
 import net.corda.core.serialization.SerializeAsToken
 import net.corda.core.serialization.SingletonSerializeAsToken
+import net.corda.core.serialization.serialize
 import net.corda.core.transactions.SignedTransaction
 import net.corda.core.utilities.NetworkHostAndPort
 import net.corda.core.utilities.debug
 import net.corda.core.utilities.getOrThrow
+import net.corda.core.utilities.minutes
 import net.corda.node.VersionInfo
 import net.corda.node.internal.classloading.requireAnnotation
 import net.corda.node.internal.cordapp.CordappLoader
@@ -72,6 +75,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.TimeUnit.SECONDS
 import kotlin.collections.set
+import kotlin.concurrent.thread
 import kotlin.reflect.KClass
 import net.corda.core.crypto.generateKeyPair as cryptoGenerateKeyPair
 
@@ -134,6 +138,8 @@ abstract class AbstractNode(config: NodeConfiguration,
     protected val runOnStop = ArrayList<() -> Any?>()
     protected lateinit var database: CordaPersistence
     protected val _nodeReadyFuture = openFuture<Unit>()
+    protected val networkMapClient: NetworkMapClient? by lazy { configuration.compatibilityZoneURL?.let(::HTTPNetworkMapClient) }
+
     /** Completes once the node has successfully registered with the network map service
      * or has loaded network map data from local database */
     val nodeReadyFuture: CordaFuture<Unit>
@@ -157,10 +163,6 @@ abstract class AbstractNode(config: NodeConfiguration,
         return CordaRPCOpsImpl(services, smm, database, flowStarter)
     }
 
-    private fun saveOwnNodeInfo() {
-        NodeInfoWatcher.saveToFile(configuration.baseDirectory, info, services.keyManagementService)
-    }
-
     private fun initCertificate() {
         if (configuration.devMode) {
             log.warn("Corda node is running in dev mode.")
@@ -170,6 +172,9 @@ abstract class AbstractNode(config: NodeConfiguration,
     }
 
     private fun makeSchemaService() = NodeSchemaService(cordappLoader)
+
+    // This is used in cordformation to distribute node info to different node's folders.
+    // TODO: We should replace this with a simple in-memory network map server.
     open fun generateNodeInfo() {
         check(started == null) { "Node has already been started" }
         initCertificate()
@@ -178,7 +183,9 @@ abstract class AbstractNode(config: NodeConfiguration,
         initialiseDatabasePersistence(schemaService) {
             val transactionStorage = makeTransactionStorage()
             makeServices(schemaService, transactionStorage, StateLoaderImpl(transactionStorage))
-            saveOwnNodeInfo()
+            val serialisedNodeInfo = info.serialize()
+            val signature = services.keyManagementService.sign(serialisedNodeInfo.bytes, info.legalIdentities.first().owningKey)
+            NodeInfoWatcher.saveToFile(configuration.baseDirectory, SignedData(serialisedNodeInfo, signature))
         }
     }
 
@@ -192,7 +199,7 @@ abstract class AbstractNode(config: NodeConfiguration,
             val transactionStorage = makeTransactionStorage()
             val stateLoader = StateLoaderImpl(transactionStorage)
             val services = makeServices(schemaService, transactionStorage, stateLoader)
-            saveOwnNodeInfo()
+            startNetworkMapUpdate()
             smm = makeStateMachineManager()
             val flowStarter = FlowStarterImpl(serverThread, smm)
             val schedulerService = NodeSchedulerService(platformClock, this@AbstractNode.database, flowStarter, stateLoader, unfinishedSchedules = busyNodeLatch, serverThread = serverThread)
@@ -229,6 +236,68 @@ abstract class AbstractNode(config: NodeConfiguration,
                 schedulerService.start()
             }
             _started = this
+        }
+    }
+
+    private fun startNetworkMapUpdate() {
+        val oldInfo = services.networkMapCache.getNodeByLegalIdentity(info.legalIdentities.first())
+        // TODO: Make this configurable?
+        val retryInterval = 1.minutes
+        // Compare node info without timestamp.
+        thread(name = "Network Map Updater Thread") {
+            // Only publish and write to disk if there are changes to the node info.
+            if (info.copy(serial = 0L) != oldInfo?.copy(serial = 0L)) {
+                // Register node info if its changed.
+                val serialisedNodeInfo = info.serialize()
+                val signature = services.keyManagementService.sign(serialisedNodeInfo.bytes, info.legalIdentities.first().owningKey)
+                val signedNodeInfo = SignedData(serialisedNodeInfo, signature)
+                networkMapClient?.let {
+                    // Register with network map if its configured.
+                    while (true) {
+                        // Retry until successfully registered with the network map.
+                        it.publish(signedNodeInfo)
+                        try {
+                            break
+                        } catch (e: IllegalArgumentException) {
+                            log.warn("Error encountered while publishing node info, will retry in $retryInterval.", e)
+                            Thread.sleep(retryInterval.toMillis())
+                        }
+                    }
+                }
+                // Write node info to file.
+                NodeInfoWatcher.saveToFile(configuration.baseDirectory, signedNodeInfo)
+            }
+
+            // TODO: Make the node info file watcher run within this thread instead of using observable?
+            val fileWatcher = NodeInfoWatcher(configuration.baseDirectory, configuration.additionalNodeInfoPollingFrequencyMsec)
+            fileWatcher.nodeInfoUpdates().subscribe { node -> services.networkMapCache.addNode(node) }
+
+            // Poll network map for updates periodically after publishing node info, if its configured.
+            networkMapClient?.let { networkMapClient ->
+                while (true) {
+                    try {
+                        val (networkMap, cacheTimeout) = networkMapClient.getNetworkMap()
+                        val currentNodeHashes = services.networkMapCache.allNodeHashes
+                        val toBeAdded = networkMap.subtract(currentNodeHashes).mapNotNull {
+                            // Download new node info from network map
+                            networkMapClient.getNodeInfo(it)
+                        }
+                        val toBeRemoved = currentNodeHashes.subtract(networkMap).mapNotNull { services.networkMapCache.getNodeByHash(it) }
+                        // Remove node info from network map.
+                        toBeRemoved.forEach {
+                            services.networkMapCache.removeNode(it)
+                        }
+                        // Add new node info to the network map cache.
+                        toBeAdded.forEach {
+                            services.networkMapCache.addNode(it)
+                        }
+                        Thread.sleep(cacheTimeout)
+                    } catch (e: IllegalArgumentException) {
+                        log.warn("Error encountered while fetching network map update, will retry in $retryInterval", e)
+                        Thread.sleep(retryInterval.toMillis())
+                    }
+                }
+            }
         }
     }
 
@@ -701,7 +770,7 @@ abstract class AbstractNode(config: NodeConfiguration,
         override val stateMachineRecordedTransactionMapping = DBTransactionMappingStorage()
         override val auditService = DummyAuditService()
         override val transactionVerifierService by lazy { makeTransactionVerifierService() }
-        override val networkMapCache by lazy { NetworkMapCacheImpl(PersistentNetworkMapCache(this@AbstractNode.database, this@AbstractNode.configuration), identityService) }
+        override val networkMapCache by lazy { NetworkMapCacheImpl(PersistentNetworkMapCache(database), identityService) }
         override val vaultService by lazy { makeVaultService(keyManagementService, stateLoader) }
         override val contractUpgradeService by lazy { ContractUpgradeServiceImpl() }
 
