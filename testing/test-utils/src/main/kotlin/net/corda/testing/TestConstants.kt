@@ -18,7 +18,6 @@ import org.bouncycastle.cert.X509CertificateHolder
 import java.math.BigInteger
 import java.security.KeyPair
 import java.security.PublicKey
-import java.security.cert.Certificate
 import java.time.Instant
 
 // A dummy time at which we will be pretending test transactions are created.
