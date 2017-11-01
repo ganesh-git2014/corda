@@ -8,7 +8,6 @@ import io.atomix.copycat.server.storage.Storage
 import io.atomix.copycat.server.storage.StorageLevel
 import net.corda.core.utilities.NetworkHostAndPort
 import net.corda.core.utilities.getOrThrow
-import net.corda.node.services.network.NetworkMapService
 import net.corda.node.utilities.CordaPersistence
 import net.corda.node.utilities.DatabaseTransaction
 import net.corda.node.utilities.configureDatabase
@@ -23,7 +22,7 @@ import org.junit.Test
 import java.util.concurrent.CompletableFuture
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
-
+/*
 class DistributedImmutableMapTests {
     data class Member(val client: CopycatClient, val server: CopycatServer)
 
@@ -111,4 +110,4 @@ class DistributedImmutableMapTests {
                 .build()
         return serverInitFuture.thenCompose { client.connect(address) }.thenApply { Member(it, server) }
     }
-}
+}*/
